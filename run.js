@@ -12,37 +12,35 @@ const SCRIPT_DIR = path.dirname(__filename);
 const DEFAULT_TOOLS_VERSION = 'v0.18.1';
 const COMMON_ENGINES = ['quakespasm', 'ironwail', 'joequake', 'vkquake', 'fteqw', 'darkplaces'];
 
-// Master default configuration data structure
+// Configuration structure with inline profile pipelines and arguments
 const DEFAULT_CONFIG = {
   settings: {
     tools: '',
     mod: 'id1',
     game: '',
-    profile: 'full',
+    profile: 'medium',
     run: 'true'
   },
-  'profile:full': {
-    pipeline: 'qbsp, light, vis'
+  'profile:fast': {
+    qbsp: '-bsp2',
+    light: '-fast',
+    vis: '-fast'
   },
-  'profile:qbsp_only': {
-    pipeline: 'qbsp'
+  'profile:medium': {
+    qbsp: '-bsp2',
+    light: '-bounce 1',
+    vis: ''
   },
-  'profile:qbsp_vis': {
-    pipeline: 'qbsp, vis'
+  'profile:prod': {
+    qbsp: '-bsp2',
+    light: '-extra -soft -bounce 2',
+    vis: '-level 4'
   },
-  flags_qbsp: {
-    '-bsp2': true
-  },
-  flags_light: {
-    '-extra': true,
-    '-soft': true
-  },
-  flags_vis: {
-    '-fast': true
+  'profile:qbsp': {
+    qbsp: '-bsp2'
   }
 };
 
-// Helper to verify if a file is an actual binary executable
 function isExecutableFile(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const ignoredExts = ['.txt', '.html', '.htm', '.md', '.png', '.jpg', '.cfg', '.pak', '.bsp', '.map', '.lit', '.vis', '.log', '.zip', '.rar', '.7z', '.json', '.ini', '.pdf', '.doc', '.cpp', '.h', '.o'];
@@ -85,7 +83,6 @@ function isExecutableFile(filePath) {
   }
 }
 
-// CLI Prompt Helpers
 function askQuestion(query) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(query, answer => {
@@ -105,7 +102,6 @@ async function chooseFromList(promptText, items) {
   }
 }
 
-// INI Serialization Helpers
 function parseIni(content) {
   const result = {};
   let currentSection = 'default';
@@ -126,7 +122,7 @@ function parseIni(content) {
         result[currentSection][key] = value;
       } else {
         result[currentSection] = result[currentSection] || {};
-        result[currentSection][trimmed] = true;
+        result[currentSection][trimmed] = '';
       }
     }
   });
@@ -138,14 +134,13 @@ function stringifyIni(data) {
   for (const [section, keys] of Object.entries(data)) {
     output += `[${section}]\n`;
     for (const [k, v] of Object.entries(keys)) {
-      output += v === true ? `${k}\n` : `${k}=${v}\n`;
+      output += v ? `${k} = ${v}\n` : `${k} =\n`;
     }
     output += '\n';
   }
   return output;
 }
 
-// Self-healing merge helper to restore missing options from DEFAULT_CONFIG
 function mergeWithDefaults(userConfig) {
   let modified = false;
   const merged = JSON.parse(JSON.stringify(userConfig || {}));
@@ -158,7 +153,7 @@ function mergeWithDefaults(userConfig) {
     }
 
     for (const [k, v] of Object.entries(keys)) {
-      if (merged[section][k] === undefined || merged[section][k] === '') {
+      if (merged[section][k] === undefined) {
         merged[section][k] = v;
         modified = true;
         console.log(`Restored missing config option: [${section}] -> ${k}=${v}`);
@@ -169,7 +164,6 @@ function mergeWithDefaults(userConfig) {
   return { config: merged, modified };
 }
 
-// Config Generation and Loading Functions
 function createDefaultConfig(configPath, overrides = {}) {
   const config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 
@@ -222,7 +216,7 @@ async function loadParseConfig(rootDir) {
 
   if (modified) {
     fs.writeFileSync(configPath, stringifyIni(config));
-    console.log(`Updated config.ini with missing default values.`);
+    console.log(`Updated config.ini with default values.`);
   }
 
   return config;
@@ -398,7 +392,6 @@ async function locateGameEngine(rootDir) {
   return '';
 }
 
-// Tool runner with explicit working directory setup
 function executeTool(executablePath, args, isMandatory = false, cwd = process.cwd()) {
   const toolName = path.basename(executablePath);
   console.log(`\n========================================`);
@@ -429,6 +422,21 @@ async function main() {
     console.log(`Script Directory: ${SCRIPT_DIR}`);
 
     const config = await loadParseConfig(rootDir);
+
+    const cliArg = process.argv[2]?.toLowerCase();
+    let profileName = config.settings.profile || 'medium';
+
+    if (cliArg) {
+      const aliases = {
+        'all': 'prod',
+        'full': 'prod',
+        'production': 'prod',
+        'qbsp_only': 'qbsp'
+      };
+      profileName = aliases[cliArg] || cliArg;
+      console.log(`Profile override via CLI: '${cliArg}' -> target profile [${profileName}]`);
+    }
+
     const mapFile = findNewestMapFile(rootDir);
     const mapName = path.basename(mapFile, '.map');
 
@@ -444,20 +452,19 @@ async function main() {
     const ext = os.platform() === 'win32' ? '.exe' : '';
     const targetMod = config.settings.mod || 'id1';
 
-    const profileName = config.settings.profile || 'full';
     const profileSection = config[`profile:${profileName}`];
     
-    if (!profileSection || !profileSection.pipeline) {
-      throw new Error(`Profile '${profileName}' is not defined in config.ini.`);
+    if (!profileSection) {
+      throw new Error(`Profile 'profile:${profileName}' is not defined in config.ini.`);
     }
 
-    const pipeline = profileSection.pipeline.split(',').map(s => s.trim().toLowerCase());
-    console.log(`Active Profile: [${profileName}] -> Pipeline: ${pipeline.join(' -> ')}`);
+    const pipelineTools = Object.keys(profileSection);
+    console.log(`Active Profile: [${profileName}] -> Pipeline: ${pipelineTools.join(' -> ')}`);
 
-    for (const tool of pipeline) {
+    for (const [tool, flagString] of Object.entries(profileSection)) {
       const toolPath = path.join(toolsDir, `${tool}${ext}`);
-      const flagsSection = config[`flags_${tool}`] || {};
-      const userFlags = Object.keys(flagsSection);
+      
+      const userFlags = flagString ? flagString.trim().split(/\s+/).filter(Boolean) : [];
 
       const toolArgs = [...userFlags];
       if (targetMod !== 'id1' && !toolArgs.includes('-gamedir')) {
