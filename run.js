@@ -172,7 +172,7 @@ function findMatchesBFS(rootDir, matchFn) {
   return matches;
 }
 
-// Find newest .map file (ignoring any inside compile folders)
+// Find newest .map file
 function findNewestMapFile(dir) {
   let newestFile = null;
   let newestMtime = 0;
@@ -380,34 +380,44 @@ async function main() {
     const config = await ensureConfig(rootDir);
     const mapFile = findNewestMapFile(rootDir);
     const mapName = path.basename(mapFile, '.map');
-    const mapSourceDir = path.dirname(mapFile);
-    
+
     console.log(`Map target: ${mapFile}`);
 
-    // Create ./compile/mapname folder in the same directory where the .map file is located
-    const compileDir = path.join(mapSourceDir, 'compile', mapName);
+    // Create compile directory in Quake root to prevent polluting map source directories
+    const compileDir = path.join(rootDir, 'compile', mapName);
     fs.mkdirSync(compileDir, { recursive: true });
 
-    // Copy original .map to the isolated compile directory
+    // Copy original .map to the isolated build directory
     const compileMapFile = path.join(compileDir, `${mapName}.map`);
     fs.copyFileSync(mapFile, compileMapFile);
 
     const toolsDir = config.settings.tools;
     const ext = os.platform() === 'win32' ? '.exe' : '';
+    const targetMod = config.settings.mod || 'id1';
 
     const pipeline = ['qbsp', 'light', 'vis'];
     for (const tool of pipeline) {
       const toolPath = path.join(toolsDir, `${tool}${ext}`);
-      const flags = Object.keys(config[`config.${tool}`] || {});
-      executeTool(toolPath, [...flags, compileMapFile]);
+      const userFlags = Object.keys(config[`config.${tool}`] || {});
+      
+      // Explicitly declare base and game directories for ericw-tools
+      const toolArgs = [...userFlags];
+      if (!toolArgs.includes('-basedir')) {
+        toolArgs.push('-basedir', rootDir);
+      }
+      if (targetMod !== 'id1' && !toolArgs.includes('-gamedir')) {
+        toolArgs.push('-gamedir', targetMod);
+      }
+      toolArgs.push(compileMapFile);
+
+      executeTool(toolPath, toolArgs);
     }
 
-    // Determine target mod directory (e.g. <rootDir>/id1/maps/)
-    const targetMod = config.settings.mod || 'id1';
+    // Determine target mod directory
     const destinationDir = path.join(rootDir, targetMod, 'maps');
     fs.mkdirSync(destinationDir, { recursive: true });
 
-    // Copy ONLY the generated .bsp file to the mod maps folder
+    // Copy ONLY the compiled .bsp file into the mod maps folder
     const bspFileName = `${mapName}.bsp`;
     const srcBspPath = path.join(compileDir, bspFileName);
     const destBspPath = path.join(destinationDir, bspFileName);
