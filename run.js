@@ -186,7 +186,6 @@ async function loadParseConfig(rootDir) {
   const configPath = path.join(SCRIPT_DIR, 'config.ini');
   const ext = os.platform() === 'win32' ? '.exe' : '';
 
-  // Generate initial config.ini if missing next to the script
   if (!fs.existsSync(configPath)) {
     console.log('\n--- First-Time Setup: config.ini not found ---');
     const toolsPath = await locateToolsDirectory(rootDir);
@@ -209,10 +208,8 @@ async function loadParseConfig(rootDir) {
   const rawContent = fs.readFileSync(configPath, 'utf-8');
   const parsed = parseIni(rawContent);
 
-  // Merge missing options/sections with default structure
   let { config, modified } = mergeWithDefaults(parsed);
 
-  // Validate configured build tools directory
   const toolsDir = config.settings.tools;
   const qbspPath = toolsDir ? path.join(toolsDir, `qbsp${ext}`) : '';
 
@@ -223,7 +220,6 @@ async function loadParseConfig(rootDir) {
     modified = true;
   }
 
-  // Rewrite updated config back to disk if self-healing restored missing options
   if (modified) {
     fs.writeFileSync(configPath, stringifyIni(config));
     console.log(`Updated config.ini with missing default values.`);
@@ -330,8 +326,21 @@ function downloadFile(url, destPath) {
 function extractZipNative(zipPath, targetDir) {
   if (os.platform() === 'win32') {
     execSync(`powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${targetDir}' -Force"`, { stdio: 'inherit' });
-  } else {
-    execSync(`tar -xf "${zipPath}" -C "${targetDir}"`, { stdio: 'inherit' });
+    return;
+  }
+
+  try {
+    execSync(`unzip -o "${zipPath}" -d "${targetDir}"`, { stdio: 'inherit' });
+  } catch {
+    try {
+      execSync(`python3 -m zipfile -e "${zipPath}" "${targetDir}"`, { stdio: 'inherit' });
+    } catch {
+      try {
+        execSync(`7z x -y "${zipPath}" -o"${targetDir}"`, { stdio: 'inherit' });
+      } catch (err) {
+        throw new Error(`Failed to extract zip file. Please install 'unzip' or 'python3'. Details: ${err.message}`);
+      }
+    }
   }
 }
 
@@ -340,11 +349,11 @@ async function locateToolsDirectory(rootDir) {
   const qbspName = `qbsp${ext}`.toLowerCase();
 
   console.log('Searching for valid qbsp build tools executable...');
-  const foundExecutables = findMatchesBFS(rootDir, (entry, fullPath) => {
+  let foundExecutables = findMatchesBFS(rootDir, (entry, fullPath) => {
     return entry.isFile() && entry.name.toLowerCase() === qbspName && isExecutableFile(fullPath);
   });
 
-  const candidateDirs = [...new Set(foundExecutables.map(filePath => path.dirname(filePath)))];
+  let candidateDirs = [...new Set(foundExecutables.map(filePath => path.dirname(filePath)))];
 
   if (candidateDirs.length === 1) return candidateDirs[0];
   if (candidateDirs.length > 1) return await chooseFromList('Multiple directories with qbsp found:', candidateDirs);
@@ -355,17 +364,26 @@ async function locateToolsDirectory(rootDir) {
 
   const zipPath = path.join(toolsDir, 'ericw-tools.zip');
   await downloadFile(getDownloadUrl(), zipPath);
+  
+  console.log('Extracting ericw-tools archive...');
   extractZipNative(zipPath, toolsDir);
   fs.unlinkSync(zipPath);
 
-  const newBinDir = path.join(toolsDir, `ericw-tools-${DEFAULT_TOOLS_VERSION}`, 'bin');
+  const extractedFiles = findMatchesBFS(toolsDir, (entry) => entry.isFile() && entry.name.toLowerCase() === qbspName);
+  if (extractedFiles.length === 0) {
+    throw new Error(`Extraction failed: qbsp executable was not found inside ${toolsDir}`);
+  }
+
+  const extractedBinDir = path.dirname(extractedFiles[0]);
+
   if (os.platform() !== 'win32') {
-    ['qbsp', 'vis', 'light'].forEach(bin => {
-      const p = path.join(newBinDir, `${bin}${ext}`);
+    ['qbsp', 'vis', 'light', 'bsputil'].forEach(bin => {
+      const p = path.join(extractedBinDir, bin);
       if (fs.existsSync(p)) fs.chmodSync(p, 0o755);
     });
   }
-  return newBinDir;
+
+  return extractedBinDir;
 }
 
 async function locateGameEngine(rootDir) {
@@ -380,15 +398,16 @@ async function locateGameEngine(rootDir) {
   return '';
 }
 
-// Tool runner with clear error feedback
-function executeTool(executablePath, args, isMandatory = false) {
+// Tool runner with explicit working directory setup
+function executeTool(executablePath, args, isMandatory = false, cwd = process.cwd()) {
   const toolName = path.basename(executablePath);
   console.log(`\n========================================`);
   console.log(`Running: ${toolName} ${args.join(' ')}`);
+  console.log(`Working Directory: ${cwd}`);
   console.log(`========================================\n`);
 
   try {
-    execFileSync(executablePath, args, { stdio: 'inherit' });
+    execFileSync(executablePath, args, { stdio: 'inherit', cwd });
     return true;
   } catch (err) {
     if (isMandatory) {
@@ -441,12 +460,13 @@ async function main() {
       const userFlags = Object.keys(flagsSection);
 
       const toolArgs = [...userFlags];
-      if (!toolArgs.includes('-basedir')) toolArgs.push('-basedir', rootDir);
-      if (targetMod !== 'id1' && !toolArgs.includes('-gamedir')) toolArgs.push('-gamedir', targetMod);
+      if (targetMod !== 'id1' && !toolArgs.includes('-gamedir')) {
+        toolArgs.push('-gamedir', targetMod);
+      }
       toolArgs.push(compileMapFile);
 
       const isMandatory = tool === 'qbsp';
-      executeTool(toolPath, toolArgs, isMandatory);
+      executeTool(toolPath, toolArgs, isMandatory, rootDir);
     }
 
     const destinationDir = path.join(rootDir, targetMod, 'maps');
@@ -467,9 +487,11 @@ async function main() {
       const gameExec = config.settings.game;
       if (gameExec && fs.existsSync(gameExec)) {
         const gameArgs = ['+map', mapName];
-        if (config.settings.mod) gameArgs.unshift('-game', config.settings.mod);
+        if (config.settings.mod && config.settings.mod !== 'id1') {
+          gameArgs.unshift('-game', config.settings.mod);
+        }
         console.log(`\nLaunching engine: ${gameExec} ${gameArgs.join(' ')}`);
-        spawn(gameExec, gameArgs, { cwd: path.dirname(gameExec), detached: true, stdio: 'ignore' }).unref();
+        spawn(gameExec, gameArgs, { cwd: rootDir, detached: true, stdio: 'ignore' }).unref();
       } else {
         console.warn('Game engine executable missing or unconfigured. Skipping launch.');
       }
