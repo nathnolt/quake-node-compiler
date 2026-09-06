@@ -41,6 +41,9 @@ const DEFAULT_CONFIG = {
   }
 };
 
+
+main()
+
 function isExecutableFile(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const ignoredExts = ['.txt', '.html', '.htm', '.md', '.png', '.jpg', '.cfg', '.pak', '.bsp', '.map', '.lit', '.vis', '.log', '.zip', '.rar', '.7z', '.json', '.ini', '.pdf', '.doc', '.cpp', '.h', '.o'];
@@ -441,10 +444,14 @@ async function main() {
     const mapName = path.basename(mapFile, '.map');
 
     console.log(`Map target: ${mapFile}`);
-
-    const compileDir = path.join(rootDir, 'compile', mapName);
+    
+    
+    const mapDir = path.dirname(mapFile);
+    
+    
+    const compileDir = path.join(mapDir, 'compile', mapName);
     fs.mkdirSync(compileDir, { recursive: true });
-
+    
     const compileMapFile = path.join(compileDir, `${mapName}.map`);
     fs.copyFileSync(mapFile, compileMapFile);
 
@@ -510,5 +517,3 @@ async function main() {
     process.exit(1);
   }
 }
-
-main();
