@@ -4,14 +4,47 @@ import https from 'https';
 import os from 'os';
 import readline from 'readline';
 import { execSync, execFileSync, spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const SCRIPT_DIR = path.dirname(__filename);
 
 const DEFAULT_TOOLS_VERSION = 'v0.18.1';
 const COMMON_ENGINES = ['quakespasm', 'ironwail', 'joequake', 'vkquake', 'fteqw', 'darkplaces'];
 
-// Helper to verify if a file is an actual executable by extension, permissions, and magic bytes
+// Master default configuration data structure
+const DEFAULT_CONFIG = {
+  settings: {
+    tools: '',
+    mod: 'id1',
+    game: '',
+    profile: 'full',
+    run: 'true'
+  },
+  'profile:full': {
+    pipeline: 'qbsp, light, vis'
+  },
+  'profile:qbsp_only': {
+    pipeline: 'qbsp'
+  },
+  'profile:qbsp_vis': {
+    pipeline: 'qbsp, vis'
+  },
+  flags_qbsp: {
+    '-bsp2': true
+  },
+  flags_light: {
+    '-extra': true,
+    '-soft': true
+  },
+  flags_vis: {
+    '-fast': true
+  }
+};
+
+// Helper to verify if a file is an actual binary executable
 function isExecutableFile(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-  
   const ignoredExts = ['.txt', '.html', '.htm', '.md', '.png', '.jpg', '.cfg', '.pak', '.bsp', '.map', '.lit', '.vis', '.log', '.zip', '.rar', '.7z', '.json', '.ini', '.pdf', '.doc', '.cpp', '.h', '.o'];
   if (ignoredExts.includes(ext)) return false;
 
@@ -38,12 +71,9 @@ function isExecutableFile(filePath) {
     fs.readSync(fd, buffer, 0, 4, 0);
     fs.closeSync(fd);
 
-    if (os.platform() === 'win32') {
-      return buffer[0] === 0x4D && buffer[1] === 0x5A;
-    }
+    if (os.platform() === 'win32') return buffer[0] === 0x4D && buffer[1] === 0x5A;
 
     const isElf = buffer[0] === 0x7F && buffer[1] === 0x45 && buffer[2] === 0x4C && buffer[3] === 0x46;
-
     const magicBE = buffer.readUInt32BE(0);
     const magicLE = buffer.readUInt32LE(0);
     const machOMagics = [0xFEEDFACE, 0xCEFAEDFE, 0xFEEDFACF, 0xCFFAEDFE, 0xCAFEBABE, 0xBEBAFECA];
@@ -55,7 +85,7 @@ function isExecutableFile(filePath) {
   }
 }
 
-// CLI Prompt Helper
+// CLI Prompt Helpers
 function askQuestion(query) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(query, answer => {
@@ -64,21 +94,18 @@ function askQuestion(query) {
   }));
 }
 
-// User selection helper
 async function chooseFromList(promptText, items) {
   console.log(`\n${promptText}`);
   items.forEach((item, index) => console.log(` [${index + 1}] ${item}`));
   while (true) {
     const choice = await askQuestion(`Select an option (1-${items.length}): `);
     const num = parseInt(choice, 10);
-    if (!isNaN(num) && num >= 1 && num <= items.length) {
-      return items[num - 1];
-    }
+    if (!isNaN(num) && num >= 1 && num <= items.length) return items[num - 1];
     console.log('Invalid selection. Try again.');
   }
 }
 
-// INI Parser & Serializer
+// INI Serialization Helpers
 function parseIni(content) {
   const result = {};
   let currentSection = 'default';
@@ -111,18 +138,100 @@ function stringifyIni(data) {
   for (const [section, keys] of Object.entries(data)) {
     output += `[${section}]\n`;
     for (const [k, v] of Object.entries(keys)) {
-      if (v === true) {
-        output += `${k}\n`;
-      } else {
-        output += `${k}=${v}\n`;
-      }
+      output += v === true ? `${k}\n` : `${k}=${v}\n`;
     }
     output += '\n';
   }
   return output;
 }
 
-// Find highest root folder containing "id1"
+// Self-healing merge helper to restore missing options from DEFAULT_CONFIG
+function mergeWithDefaults(userConfig) {
+  let modified = false;
+  const merged = JSON.parse(JSON.stringify(userConfig || {}));
+
+  for (const [section, keys] of Object.entries(DEFAULT_CONFIG)) {
+    if (!merged[section]) {
+      merged[section] = JSON.parse(JSON.stringify(keys));
+      modified = true;
+      continue;
+    }
+
+    for (const [k, v] of Object.entries(keys)) {
+      if (merged[section][k] === undefined || merged[section][k] === '') {
+        merged[section][k] = v;
+        modified = true;
+        console.log(`Restored missing config option: [${section}] -> ${k}=${v}`);
+      }
+    }
+  }
+
+  return { config: merged, modified };
+}
+
+// Config Generation and Loading Functions
+function createDefaultConfig(configPath, overrides = {}) {
+  const config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+
+  if (overrides.settings) {
+    Object.assign(config.settings, overrides.settings);
+  }
+
+  fs.writeFileSync(configPath, stringifyIni(config));
+  console.log(`Created default config.ini at: ${configPath}`);
+  return config;
+}
+
+async function loadParseConfig(rootDir) {
+  const configPath = path.join(SCRIPT_DIR, 'config.ini');
+  const ext = os.platform() === 'win32' ? '.exe' : '';
+
+  // Generate initial config.ini if missing next to the script
+  if (!fs.existsSync(configPath)) {
+    console.log('\n--- First-Time Setup: config.ini not found ---');
+    const toolsPath = await locateToolsDirectory(rootDir);
+    const runInput = await askQuestion('Should the engine auto-run after compilation? (true/false) [default: true]: ');
+    const run = runInput.toLowerCase() === 'false' ? 'false' : 'true';
+    const gamePath = run === 'true' ? await locateGameEngine(rootDir) : '';
+    const modName = await askQuestion('Target Mod Name (leave blank for id1): ');
+
+    return createDefaultConfig(configPath, {
+      settings: {
+        tools: toolsPath,
+        game: gamePath,
+        mod: modName || 'id1',
+        run: run
+      }
+    });
+  }
+
+  console.log(`Loading config from: ${configPath}`);
+  const rawContent = fs.readFileSync(configPath, 'utf-8');
+  const parsed = parseIni(rawContent);
+
+  // Merge missing options/sections with default structure
+  let { config, modified } = mergeWithDefaults(parsed);
+
+  // Validate configured build tools directory
+  const toolsDir = config.settings.tools;
+  const qbspPath = toolsDir ? path.join(toolsDir, `qbsp${ext}`) : '';
+
+  if (!toolsDir || !isExecutableFile(qbspPath)) {
+    console.log(`\nWarning: Configured tools path is invalid or missing qbsp executable. Re-scanning...`);
+    const newToolsPath = await locateToolsDirectory(rootDir);
+    config.settings.tools = newToolsPath;
+    modified = true;
+  }
+
+  // Rewrite updated config back to disk if self-healing restored missing options
+  if (modified) {
+    fs.writeFileSync(configPath, stringifyIni(config));
+    console.log(`Updated config.ini with missing default values.`);
+  }
+
+  return config;
+}
+
 function findQuakeRoot(startDir = process.cwd()) {
   let currentDir = path.resolve(startDir);
   let highestId1Dir = null;
@@ -137,13 +246,10 @@ function findQuakeRoot(startDir = process.cwd()) {
     currentDir = parentDir;
   }
 
-  if (!highestId1Dir) {
-    throw new Error('Could not find any directory containing an "id1" folder in the path tree.');
-  }
+  if (!highestId1Dir) throw new Error('Could not find any directory containing an "id1" folder.');
   return highestId1Dir;
 }
 
-// BFS traversal across folders
 function findMatchesBFS(rootDir, matchFn) {
   const matches = [];
   const queue = [rootDir];
@@ -159,20 +265,15 @@ function findMatchesBFS(rootDir, matchFn) {
 
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
-      if (entry.isDirectory()) {
-        if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== 'compile') {
-          queue.push(fullPath);
-        }
+      if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== 'compile') {
+        queue.push(fullPath);
       }
-      if (matchFn(entry, fullPath)) {
-        matches.push(fullPath);
-      }
+      if (matchFn(entry, fullPath)) matches.push(fullPath);
     }
   }
   return matches;
 }
 
-// Find newest .map file
 function findNewestMapFile(dir) {
   let newestFile = null;
   let newestMtime = 0;
@@ -198,7 +299,6 @@ function findNewestMapFile(dir) {
   return newestFile;
 }
 
-// Downloads
 function getDownloadUrl() {
   const platform = os.platform();
   const arch = os.arch();
@@ -235,7 +335,6 @@ function extractZipNative(zipPath, targetDir) {
   }
 }
 
-// Search for validated qbsp binary
 async function locateToolsDirectory(rootDir) {
   const ext = os.platform() === 'win32' ? '.exe' : '';
   const qbspName = `qbsp${ext}`.toLowerCase();
@@ -247,14 +346,8 @@ async function locateToolsDirectory(rootDir) {
 
   const candidateDirs = [...new Set(foundExecutables.map(filePath => path.dirname(filePath)))];
 
-  if (candidateDirs.length === 1) {
-    console.log(`Found build tools in: ${candidateDirs[0]}`);
-    return candidateDirs[0];
-  }
-
-  if (candidateDirs.length > 1) {
-    return await chooseFromList('Multiple directories with qbsp found. Which build tools do you want to use?', candidateDirs);
-  }
+  if (candidateDirs.length === 1) return candidateDirs[0];
+  if (candidateDirs.length > 1) return await chooseFromList('Multiple directories with qbsp found:', candidateDirs);
 
   console.log('No qbsp executable found. Downloading ericw-tools...');
   const toolsDir = path.join(rootDir, 'tools');
@@ -266,108 +359,46 @@ async function locateToolsDirectory(rootDir) {
   fs.unlinkSync(zipPath);
 
   const newBinDir = path.join(toolsDir, `ericw-tools-${DEFAULT_TOOLS_VERSION}`, 'bin');
-  
   if (os.platform() !== 'win32') {
     ['qbsp', 'vis', 'light'].forEach(bin => {
       const p = path.join(newBinDir, `${bin}${ext}`);
       if (fs.existsSync(p)) fs.chmodSync(p, 0o755);
     });
   }
-
   return newBinDir;
 }
 
-// Game engine binary resolution
 async function locateGameEngine(rootDir) {
   const engines = findMatchesBFS(rootDir, (entry, fullPath) => {
     if (!entry.isFile()) return false;
-    
-    const ext = path.extname(entry.name);
-    const nameWithoutExt = path.basename(entry.name, ext).toLowerCase();
-
-    if (!COMMON_ENGINES.includes(nameWithoutExt)) return false;
-
-    return isExecutableFile(fullPath);
+    const nameWithoutExt = path.basename(entry.name, path.extname(entry.name)).toLowerCase();
+    return COMMON_ENGINES.includes(nameWithoutExt) && isExecutableFile(fullPath);
   });
 
   if (engines.length === 1) return engines[0];
-  if (engines.length > 1) {
-    return await chooseFromList('Multiple Quake game engines detected:', engines);
-  }
+  if (engines.length > 1) return await chooseFromList('Multiple Quake game engines detected:', engines);
   return '';
 }
 
-// Config setup & validation
-async function ensureConfig(rootDir) {
-  const configPath = path.join(rootDir, 'config.ini');
-  const ext = os.platform() === 'win32' ? '.exe' : '';
-
-  if (fs.existsSync(configPath)) {
-    const configData = parseIni(fs.readFileSync(configPath, 'utf-8'));
-    const toolsDir = configData.settings?.tools;
-    const qbspPath = toolsDir ? path.join(toolsDir, `qbsp${ext}`) : '';
-
-    if (toolsDir && isExecutableFile(qbspPath)) {
-      console.log(`Loaded config: ${configPath}`);
-      return configData;
-    }
-
-    console.log(`Warning: Configured tools path is invalid or missing executable qbsp. Re-scanning...`);
-    const newToolsPath = await locateToolsDirectory(rootDir);
-    configData.settings = configData.settings || {};
-    configData.settings.tools = newToolsPath;
-    
-    fs.writeFileSync(configPath, stringifyIni(configData));
-    console.log(`Updated config.ini with valid tools path: ${newToolsPath}`);
-    return configData;
-  }
-
-  console.log('\n--- First-Time Setup: config.ini not found ---');
-  const toolsPath = await locateToolsDirectory(rootDir);
-  const runInput = await askQuestion('Should the engine auto-run after compilation? (true/false) [default: true]: ');
-  const run = runInput.toLowerCase() === 'false' ? 'false' : 'true';
-
-  let gamePath = '';
-  if (run === 'true') {
-    gamePath = await locateGameEngine(rootDir);
-  }
-
-  const modName = await askQuestion('Target Mod Name (leave blank for id1): ');
-
-  const initialConfig = {
-    settings: {
-      tools: toolsPath,
-      mod: modName,
-      game: gamePath,
-      output: '/built/',
-      buildconfig: 'full',
-      run: run
-    },
-    'config.full': {
-      'qbsp {map}': true,
-      'light {map}': true,
-      'vis {map}': true
-    },
-    'config.qbsp': { '-bsp2': true },
-    'config.light': { '-extra': true, '-soft': true },
-    'config.vis': { '-fast': true }
-  };
-
-  fs.writeFileSync(configPath, stringifyIni(initialConfig));
-  console.log(`Created config.ini at: ${configPath}`);
-  return initialConfig;
-}
-
-function executeTool(executablePath, args) {
+// Tool runner with clear error feedback
+function executeTool(executablePath, args, isMandatory = false) {
+  const toolName = path.basename(executablePath);
   console.log(`\n========================================`);
-  console.log(`Executing: ${path.basename(executablePath)} ${args.join(' ')}`);
+  console.log(`Running: ${toolName} ${args.join(' ')}`);
   console.log(`========================================\n`);
 
   try {
     execFileSync(executablePath, args, { stdio: 'inherit' });
+    return true;
   } catch (err) {
-    console.error(`Execution failed: ${path.basename(executablePath)}`);
-    process.exit(1);
+    if (isMandatory) {
+      console.error(`\n❌ FATAL ERROR: Mandatory step '${toolName}' failed. Build aborted.`);
+      process.exit(1);
+    } else {
+      console.warn(`\n⚠️  WARNING: Tool '${toolName}' failed or crashed!`);
+      console.warn(`👉 Action: Skipping '${toolName}' and proceeding with the build using existing artifacts.`);
+      return false;
+    }
   }
 }
 
@@ -376,18 +407,17 @@ async function main() {
     const rootDir = findQuakeRoot();
     process.chdir(rootDir);
     console.log(`Quake Root Path: ${rootDir}`);
+    console.log(`Script Directory: ${SCRIPT_DIR}`);
 
-    const config = await ensureConfig(rootDir);
+    const config = await loadParseConfig(rootDir);
     const mapFile = findNewestMapFile(rootDir);
     const mapName = path.basename(mapFile, '.map');
 
     console.log(`Map target: ${mapFile}`);
 
-    // Create compile directory in Quake root to prevent polluting map source directories
     const compileDir = path.join(rootDir, 'compile', mapName);
     fs.mkdirSync(compileDir, { recursive: true });
 
-    // Copy original .map to the isolated build directory
     const compileMapFile = path.join(compileDir, `${mapName}.map`);
     fs.copyFileSync(mapFile, compileMapFile);
 
@@ -395,29 +425,33 @@ async function main() {
     const ext = os.platform() === 'win32' ? '.exe' : '';
     const targetMod = config.settings.mod || 'id1';
 
-    const pipeline = ['qbsp', 'light', 'vis'];
-    for (const tool of pipeline) {
-      const toolPath = path.join(toolsDir, `${tool}${ext}`);
-      const userFlags = Object.keys(config[`config.${tool}`] || {});
-      
-      // Explicitly declare base and game directories for ericw-tools
-      const toolArgs = [...userFlags];
-      if (!toolArgs.includes('-basedir')) {
-        toolArgs.push('-basedir', rootDir);
-      }
-      if (targetMod !== 'id1' && !toolArgs.includes('-gamedir')) {
-        toolArgs.push('-gamedir', targetMod);
-      }
-      toolArgs.push(compileMapFile);
-
-      executeTool(toolPath, toolArgs);
+    const profileName = config.settings.profile || 'full';
+    const profileSection = config[`profile:${profileName}`];
+    
+    if (!profileSection || !profileSection.pipeline) {
+      throw new Error(`Profile '${profileName}' is not defined in config.ini.`);
     }
 
-    // Determine target mod directory
+    const pipeline = profileSection.pipeline.split(',').map(s => s.trim().toLowerCase());
+    console.log(`Active Profile: [${profileName}] -> Pipeline: ${pipeline.join(' -> ')}`);
+
+    for (const tool of pipeline) {
+      const toolPath = path.join(toolsDir, `${tool}${ext}`);
+      const flagsSection = config[`flags_${tool}`] || {};
+      const userFlags = Object.keys(flagsSection);
+
+      const toolArgs = [...userFlags];
+      if (!toolArgs.includes('-basedir')) toolArgs.push('-basedir', rootDir);
+      if (targetMod !== 'id1' && !toolArgs.includes('-gamedir')) toolArgs.push('-gamedir', targetMod);
+      toolArgs.push(compileMapFile);
+
+      const isMandatory = tool === 'qbsp';
+      executeTool(toolPath, toolArgs, isMandatory);
+    }
+
     const destinationDir = path.join(rootDir, targetMod, 'maps');
     fs.mkdirSync(destinationDir, { recursive: true });
 
-    // Copy ONLY the compiled .bsp file into the mod maps folder
     const bspFileName = `${mapName}.bsp`;
     const srcBspPath = path.join(compileDir, bspFileName);
     const destBspPath = path.join(destinationDir, bspFileName);
@@ -426,16 +460,14 @@ async function main() {
       fs.copyFileSync(srcBspPath, destBspPath);
       console.log(`\nSuccessfully copied BSP: ${bspFileName} -> ${destinationDir}`);
     } else {
-      throw new Error(`Compilation finished, but expected BSP file was not found at: ${srcBspPath}`);
+      throw new Error(`Expected BSP file was not found at: ${srcBspPath}`);
     }
 
     if (config.settings.run === 'true') {
       const gameExec = config.settings.game;
       if (gameExec && fs.existsSync(gameExec)) {
         const gameArgs = ['+map', mapName];
-        if (config.settings.mod) {
-          gameArgs.unshift('-game', config.settings.mod);
-        }
+        if (config.settings.mod) gameArgs.unshift('-game', config.settings.mod);
         console.log(`\nLaunching engine: ${gameExec} ${gameArgs.join(' ')}`);
         spawn(gameExec, gameArgs, { cwd: path.dirname(gameExec), detached: true, stdio: 'ignore' }).unref();
       } else {
@@ -443,7 +475,7 @@ async function main() {
       }
     }
 
-    console.log('\nCompilation pipeline finished!');
+    console.log('\nCompilation completed!');
   } catch (error) {
     console.error('Fatal error:', error.message);
     process.exit(1);
